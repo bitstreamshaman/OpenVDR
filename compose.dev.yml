@@ -14,5 +14,28 @@ services:
     volumes:
       - postgres-dev-data:/var/lib/postgresql/data
 
+  minio:
+    image: quay.io/minio/minio
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - ~/minio/data:/data
+    command: server /data --console-address ":9001"
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/var/lib/ollama
+
 volumes:
   postgres-dev-data:
+  ollama-data:
