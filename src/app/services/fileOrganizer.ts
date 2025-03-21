@@ -1,6 +1,11 @@
 // src/services/fileOrganizer.ts
 import * as Minio from 'minio';
-import axios from 'axios';
+import { z } from 'zod';
+import OpenAI from "openai";
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
 
 interface MinioObject {
   name: string;
@@ -28,11 +33,13 @@ interface OrganizationSuggestion {
   uniqueFolders: string[];
 }
 
+// Define the schema for file organization
+const FileOrganizationSchema = z.record(z.string(), z.string());
+
 export class FileOrganizerService {
   private minioClient: Minio.Client;
+  private openai: OpenAI;
   private bucketName: string;
-  private ollamaEndpoint: string;
-  private modelName: string;
 
   constructor() {
     // Initialize MinIO client
@@ -44,9 +51,12 @@ export class FileOrganizerService {
       secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin',
     });
 
+    // Initialize OpenAI client
+    this.openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
     this.bucketName = process.env.MINIO_BUCKET_NAME || 'nextjs-uploads';
-    this.ollamaEndpoint = process.env.OLLAMA_ENDPOINT || 'http://localhost:11434';
-    this.modelName = process.env.OLLAMA_MODEL || 'deepseek-r1:1.5b';
   }
 
   /**
@@ -61,7 +71,6 @@ export class FileOrganizerService {
     return new Promise((resolve, reject) => {
       stream.on('data', (obj: MinioObject) => {
         // Filter out already organized files (those in topic folders)
-        // This assumes organized files are in folders created by the AI
         if (!obj.name || obj.name.includes('/_organized/')) {
           return;
         }
@@ -85,10 +94,9 @@ export class FileOrganizerService {
   }
 
   /**
-   * Analyze file names and suggest organization
+   * Analyze file names and suggest organization using OpenAI
    */
-  // Enhanced version of suggestOrganization with better debugging
-async suggestOrganization(files: FileMetadata[]): Promise<OrganizationSuggestion> {
+  async suggestOrganization(files: FileMetadata[]): Promise<OrganizationSuggestion> {
     console.log(`Attempting to organize ${files.length} files`);
     
     // If no files, return empty suggestion
@@ -97,76 +105,85 @@ async suggestOrganization(files: FileMetadata[]): Promise<OrganizationSuggestion
       return { files: [], uniqueFolders: [] };
     }
   
-    // Prepare a prompt for the Ollama model
-    const fileNames = files.map(file => file.name).join('\n');
-    const prompt = `
-  I have the following files that need to be organized into topic folders for my Real Estate Deal:
-  
-  ${fileNames}
-  
-  For each file, suggest a single topic folder name where it should be placed.
-  The folder name should be short (1-3 words), descriptive, and based solely on the filename.
-  Use a consistent naming convention for similar files.
-  Return the results in the following format without any additional explanation:
-  
-  filename1: folder_name
-  filename2: folder_name
-  (and so on for each file)
-  `;
-  
-    console.log('Prompt for Ollama:', prompt);
-  
+    // Get just the file names for the prompt
+    const fileNames = files.map(file => file.name);
+    
     try {
-      // Call the Ollama API
-      console.log(`Calling Ollama API at ${this.ollamaEndpoint} with model ${this.modelName}`);
-      const response = await axios.post(`${this.ollamaEndpoint}/api/generate`, {
-        model: this.modelName,
-        prompt: prompt,
-        stream: false
+      // Create the prompt with instructions for file organization
+      const prompt = `
+I have the following files that need to be organized into topic folders for my Real Estate Deal:
+${fileNames.join('\n')}
+
+For each file, suggest a single topic folder name where it should be placed. The folder name should be:
+* Short (1-3 words)
+* Descriptive
+* Consistently named for similar types of documents
+
+Return the result as a JSON object where each key is a filename and each value is the suggested folder name.
+
+Include ALL files from the list above in your response. Format the response as a valid JSON object ONLY, with no additional text.
+`;
+
+      // Call the OpenAI API
+      const completion = await this.openai.chat.completions.create({
+        model: process.env.OPENAI_MODEL || "gpt-4o",
+        messages: [
+          { 
+            role: "system", 
+            content: "You are a helpful assistant that organizes files into logical folders. Respond with ONLY a JSON object, nothing else." 
+          },
+          { 
+            role: "user", 
+            content: prompt 
+          }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1 // Lower temperature for more consistent results
       });
-  
-      // Parse the response
-      const ollamaResponse = response.data.response;
-      console.log('Raw Ollama response:', ollamaResponse);
+
+      // Parse the JSON string response
+      const responseContent = completion.choices[0].message.content || '{}';
+      let fileOrganization;
       
-      const suggestions: Record<string, string> = {};
-      
-      // Extract filename: folder pairs from the response
-      const lines = ollamaResponse.split('\n');
-      console.log(`Splitting response into ${lines.length} lines`);
-      
-      for (const line of lines) {
-        console.log(`Processing line: "${line}"`);
-        // More robust parsing - look for first colon only
-        const colonIndex = line.indexOf(':');
-        if (colonIndex > 0) {
-          const filename = line.substring(0, colonIndex).trim();
-          const folder = line.substring(colonIndex + 1).trim();
-          
-          // Normalize folder name
-          const normalizedFolder = folder.replace(/\s+/g, '-').toLowerCase();
-          suggestions[filename] = normalizedFolder;
-          
-          console.log(`Parsed suggestion: "${filename}" → "${normalizedFolder}"`);
-        }
+      try {
+        fileOrganization = JSON.parse(responseContent);
+        // Validate with Zod schema
+        fileOrganization = FileOrganizationSchema.parse(fileOrganization);
+      } catch (parseError) {
+        console.error("Failed to parse model response:", parseError);
+        console.log("Raw response content:", responseContent);
+        throw new Error("Failed to parse the API response as valid JSON");
       }
-  
-      // Verify we got suggestions for all files
-      for (const file of files) {
-        if (!suggestions[file.name]) {
-          console.warn(`No suggestion found for file: ${file.name}`);
-        }
+      
+      // Verify that all files are included
+      const missingFiles = fileNames.filter(file => !(file in fileOrganization));
+      if (missingFiles.length > 0) {
+        console.warn("Warning: The following files were not organized:", missingFiles);
+        
+        // For missing files, create placeholder folders based on filename patterns
+        missingFiles.forEach(file => {
+          fileOrganization[file] = this.categorizeFile(file);
+        });
       }
-  
+      
+      console.log("File organization suggestion:");
+      console.log(JSON.stringify(fileOrganization, null, 2));
+      
+      // Check the quality of folder names and improve if needed
+      const improvedOrganization = this.improveFolderNames(fileOrganization);
+      
       // Create the organization suggestion
       const result: OrganizationSuggestion = {
         files: [],
         uniqueFolders: []
       };
-  
+      
       // Map the suggestions to files
       for (const file of files) {
-        const suggestedFolder = suggestions[file.name] || 'uncategorized';
+        let suggestedFolder = improvedOrganization[file.name] || 'Uncategorized';
+        
+        // Normalize folder name (lowercase, replace spaces with hyphens)
+        suggestedFolder = suggestedFolder.replace(/\s+/g, '-').toLowerCase();
         
         result.files.push({
           objectName: file.objectName,
@@ -180,29 +197,29 @@ async suggestOrganization(files: FileMetadata[]): Promise<OrganizationSuggestion
           result.uniqueFolders.push(suggestedFolder);
         }
       }
-  
+      
       console.log('Organization suggestion result:', JSON.stringify(result, null, 2));
       return result;
     } catch (error) {
-      console.error('Error calling Ollama:', error);
-      if (axios.isAxiosError(error)) {
-        console.error('Axios error details:', error.response?.data || error.message);
-      }
+      console.error('Error using OpenAI API:', error);
       
-      // Fallback: put everything in 'uncategorized'
+      // Use fallback categorization logic
       console.log('Using fallback categorization');
       return {
         files: files.map(file => ({
           objectName: file.objectName,
-          suggestedFolder: 'uncategorized',
+          suggestedFolder: this.categorizeFile(file.name).replace(/\s+/g, '-').toLowerCase(),
           originalFolder: file.path.includes('/') 
             ? file.path.substring(0, file.path.lastIndexOf('/')) 
             : null
         })),
-        uniqueFolders: ['uncategorized']
+        uniqueFolders: Array.from(new Set(files.map(file => 
+          this.categorizeFile(file.name).replace(/\s+/g, '-').toLowerCase()
+        )))
       };
     }
   }
+
   /**
    * Apply organization by moving files in MinIO
    */
@@ -240,6 +257,116 @@ async suggestOrganization(files: FileMetadata[]): Promise<OrganizationSuggestion
       console.error('Error applying organization:', error);
       return false;
     }
+  }
+
+  /**
+   * Function to categorize files based on filename patterns (fallback if API fails)
+   */
+  private categorizeFile(filename: string): string {
+    if (filename.includes('1099')) return 'Tax Documents';
+    if (filename.includes('Addendum')) return 'Contract Addendums';
+    if (filename.includes('Affidavit')) return 'Legal Documents';
+    if (filename.includes('Agent')) return 'Agent Communications';
+    if (filename.includes('Appraisal')) return 'Property Valuation';
+    if (filename.includes('Asbestos') || filename.includes('Inspection')) return 'Inspection Reports';
+    if (filename.includes('Attorney')) return 'Legal Correspondence';
+    if (filename.includes('Balance') || filename.includes('Statement')) return 'Financial Documents';
+    if (filename.includes('Tenant') || filename.includes('Lease')) return 'Tenant Records';
+    if (filename.includes('Insurance')) return 'Insurance Documents';
+    if (filename.includes('Tax')) return 'Tax Documents';
+    if (filename.includes('Title')) return 'Title Documents';
+    if (filename.includes('Property')) return 'Property Documents';
+    if (filename.includes('Loan')) return 'Loan Documents';
+    if (filename.includes('HOA')) return 'HOA Documents';
+    if (filename.includes('Utility')) return 'Utilities';
+    if (filename.includes('Contract')) return 'Contracts';
+    return 'Miscellaneous';
+  }
+
+  /**
+   * Function to improve folder names for clarity and consistency
+   */
+  private improveFolderNames(organization: z.infer<typeof FileOrganizationSchema>) {
+    const folderNameMap: Record<string, string> = {
+      // Map inadequate folder names to better ones
+      '1099': 'Tax Documents',
+      'Forms': 'Tax Documents',
+      'Addendum': 'Contract Addendums',
+      'Emails': 'Communications',
+      'Report': 'Reports',
+      'Correspondence': 'Communications',
+      'Financial': 'Financial Documents',
+      'Statement': 'Financial Documents',
+      'Loan': 'Loan Documents',
+      'Insurance': 'Insurance Documents',
+      'Tenant': 'Tenant Records',
+      'HOA': 'HOA Documents',
+      'Title': 'Title Documents',
+      'Permits': 'Permits',
+      'Inspection': 'Inspection Reports',
+      'Legal': 'Legal Documents',
+      'Utility': 'Utilities',
+      'Tax': 'Tax Documents',
+      'Property': 'Property Documents',
+      'Contract': 'Contracts'
+    };
+    
+    const improved = {...organization};
+    
+    // Replace any generic folder names with better alternatives
+    Object.keys(improved).forEach(file => {
+      const currentFolder = improved[file];
+      if (folderNameMap[currentFolder]) {
+        improved[file] = folderNameMap[currentFolder];
+      }
+    });
+    
+    // Ensure consistency for similar document types
+    const fileGroups: { [key: string]: string[] } = {};
+    Object.keys(improved).forEach(file => {
+      const prefix = file.split('_')[0];
+      if (!fileGroups[prefix]) {
+        fileGroups[prefix] = [];
+      }
+      fileGroups[prefix].push(file);
+    });
+    
+    // Make sure files with the same prefix go to the same folder
+    Object.keys(fileGroups).forEach(prefix => {
+      if (fileGroups[prefix].length > 1) {
+        const folders = fileGroups[prefix].map(file => improved[file]);
+        const mostCommonFolder = this.getMostCommonItem(folders);
+        
+        // Assign the most common folder to all files in this group
+        fileGroups[prefix].forEach(file => {
+          improved[file] = mostCommonFolder;
+        });
+      }
+    });
+    
+    return improved;
+  }
+
+  /**
+   * Helper function to find the most common item in an array
+   */
+  private getMostCommonItem(arr: string[]): string {
+    const counts: { [key: string]: number } = {};
+    arr.forEach(item => {
+      counts[item] = (counts[item] || 0) + 1;
+    });
+    
+    let maxCount = 0;
+    let mostCommon = arr[0];
+    
+    Object.keys(counts).forEach(item => {
+      if (counts[item] > maxCount) {
+        maxCount = counts[item];
+        mostCommon = item;
+      }
+    });
+    
+    return mostCommon;
   }
 
   /**
