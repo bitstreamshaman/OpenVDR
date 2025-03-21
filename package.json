@@ -11,24 +11,16 @@
   "dependencies": {
     "@auth/prisma-adapter": "^2.8.0",
     "@prisma/client": "^6.5.0",
-<<<<<<< HEAD
     "axios": "^1.8.4",
     "bcrypt": "^5.1.1",
     "minio": "^8.0.5",
-=======
-    "bcrypt": "^5.1.1",
->>>>>>> 314f2b0aaf08f428d4f6d2dce92bc59e5906adee
     "next": "15.2.2",
     "next-auth": "^4.24.7",
     "prisma": "^6.5.0",
     "react": "^19.0.0",
-<<<<<<< HEAD
     "react-dom": "^19.0.0",
     "react-dropzone": "^14.3.8",
     "uuid": "^11.1.0"
-=======
-    "react-dom": "^19.0.0"
->>>>>>> 314f2b0aaf08f428d4f6d2dce92bc59e5906adee
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
